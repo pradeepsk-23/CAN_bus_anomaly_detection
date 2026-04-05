@@ -45,6 +45,7 @@ class EnsembleAnomalyDetector:
         self.lstm_ae = lstm_ae.to(device)
         self.isolation_forest = isolation_forest
         self.device = device
+        self.cfg = cfg
 
         ensemble_cfg = cfg["models"]["ensemble"]
         self.ae_weight = ensemble_cfg["lstm_ae_weight"]
@@ -101,30 +102,66 @@ class EnsembleAnomalyDetector:
         """
         Calibrate decision threshold on validation data.
 
-        Strategies:
-          f1_optimal — grid-search threshold maximising F1
-          percentile — score percentile on normal val samples
+        Strategies
+        ----------
+        f1_optimal
+            Grid-search the threshold that maximises F1 on the val set.
+            Requires anomalous examples in val — if none are present
+            (e.g. val is all-normal by design), automatically falls back
+            to the percentile strategy and logs a warning.
+
+        percentile
+            Set threshold at the 95th percentile of normal-window scores.
+            Works even when val has no anomalies — correct choice when
+            df_ambient is the val source.
+
+        Design note
+        -----------
+        When the train/val split is derived entirely from normal (ambient)
+        data, val contains zero anomalies.  F1-optimal calibration is
+        impossible in that case.  The percentile approach is principled:
+        it accepts ~5 % false-positive rate on normal traffic, which is a
+        common operational target for fleet health systems.
         """
         from sklearn.metrics import f1_score
 
-        scores = self.score(X_val)
+        scores        = self.score(X_val)
+        n_positives   = int(y_val.sum())
+        normal_scores = scores[y_val == 0]
 
         if strategy == "f1_optimal":
-            best_f1, best_thr = 0.0, 0.5
-            for thr in np.linspace(scores.min(), scores.max(), 200):
-                preds = (scores >= thr).astype(int)
-                if preds.sum() == 0:
-                    continue
-                f1 = f1_score(y_val, preds, zero_division=0)
-                if f1 > best_f1:
-                    best_f1, best_thr = f1, thr
-            self.threshold = best_thr
-            logger.info("Threshold calibrated (F1-optimal) → {:.4f} | val_F1={:.4f}", best_thr, best_f1)
+            if n_positives == 0:
+                logger.warning(
+                    "Val set has no anomalous windows (all-normal by design). "
+                    "F1-optimal calibration impossible — falling back to 95th-percentile."
+                )
+                strategy = "percentile"   # fall through to percentile branch
 
-        elif strategy == "percentile":
-            normal_scores = scores[y_val == 0]
-            self.threshold = float(np.percentile(normal_scores, 95))
-            logger.info("Threshold calibrated (95th-pct on normals) → {:.4f}", self.threshold)
+            else:
+                best_f1, best_thr = 0.0, float(np.median(scores))
+                for thr in np.linspace(scores.min(), scores.max(), 300):
+                    preds = (scores >= thr).astype(int)
+                    if preds.sum() == 0:
+                        continue
+                    f1 = f1_score(y_val, preds, zero_division=0)
+                    if f1 > best_f1:
+                        best_f1, best_thr = f1, float(thr)
+                self.threshold = best_thr
+                logger.info(
+                    "Threshold calibrated (F1-optimal) → {:.4f} | val_F1={:.4f}",
+                    best_thr, best_f1,
+                )
+                return self.threshold
+
+        if strategy == "percentile":
+            # Use 95th percentile of normal-window scores:
+            # ~95 % of normal traffic scores below this → ~5 % FPR target.
+            pct = self.cfg.get("evaluation", {}).get("percentile", 95)
+            self.threshold = float(np.percentile(normal_scores, pct))
+            logger.info(
+                "Threshold calibrated ({}th-percentile of normal val scores) → {:.4f}",
+                pct, self.threshold,
+            )
 
         return self.threshold
 

@@ -1,81 +1,94 @@
 # =============================================================================
-# Vehicle Edge AI — Unsupervised Anomaly Detection
-# Configuration file. All tunables live here; code stays clean.
+# Vehicle Edge AI - Unsupervised Anomaly Detection
+# Configuration - aligned with ROAD dataset schema (Signal_1_of_ID…Signal_22_of_ID)
 # =============================================================================
 
 project:
   name: vehicle-anomaly-detection
-  version: "1.0.0"
+  version: "1.1.0"
   seed: 42
 
 # -----------------------------------------------------------------------------
 # DATA
 # -----------------------------------------------------------------------------
 data:
-  # Set mode to "road" to use the ROAD dataset (see README for download steps),
-  # or "synthetic" to use the built-in CAN-bus simulator.
-  mode: synthetic   # Options: synthetic | road | custom
+  # "road"      -> use the downloaded ROAD dataset (see README for path setup)
+  # "synthetic" -> use the built-in CAN-bus simulator (same column schema)
+  mode: road
 
-  # ROAD dataset path (only used when mode=road)
-  road_dataset_path: data/road/
+  # ROAD dataset root (only used when mode=road)
+  # Expected layout:
+  #   road_dataset_path/
+  #       ambient/          <- all .csv here  ->  TRAIN + VAL (normal)
+  #       attacks/          <- all .csv here (any depth) -> TEST (anomalous)
+  road_dataset_path: ../data/road/signal_extractions/
 
-  # Synthetic generation parameters
+  # Synthetic generation (ignored when mode=road)
   synthetic:
-    n_vehicles: 5            # independent vehicle ECU streams to simulate
-    duration_seconds: 7200   # 2-hour drive per vehicle
-    sampling_hz: 10          # 10 Hz CAN bus polling
-    anomaly_ratio: 0.03      # ~3% of windows flagged anomalous
-    noise_std: 0.05          # background sensor noise
+    n_ambient_vehicles: 5
+    n_attack_vehicles:  2
+    duration_ambient_s: 7200
+    duration_attack_s:  1800
+    sampling_hz: 10
+    anomaly_ratio: 0.08
+    noise_std: 0.05
+
+  # Val split taken from ambient data only - 80/20
+  val_split: 0.20
 
   # Sliding-window parameters
   window:
     size: 50          # 5-second window at 10 Hz
     stride: 10        # 1-second stride → heavy overlap for training coverage
-    train_split: 0.70
-    val_split: 0.15
-    # remaining 0.15 → test set
-
-  # Signal channels (names map to simulator columns and ROAD dataset signals)
+  # 22 channels - exact names from the ROAD dataset CSVs.
+  # Simulator produces the same column names.
   channels:
-    - engine_rpm
-    - vehicle_speed_kmh
-    - battery_voltage_v
-    - oil_pressure_bar
-    - coolant_temp_c
-    - throttle_position_pct
-    - can_latency_us
-    - accel_x_g
-    - accel_y_g
-    - accel_z_g
+    - Signal_1_of_ID
+    - Signal_2_of_ID
+    - Signal_3_of_ID
+    - Signal_4_of_ID
+    - Signal_5_of_ID
+    - Signal_6_of_ID
+    - Signal_7_of_ID
+    - Signal_8_of_ID
+    - Signal_9_of_ID
+    - Signal_10_of_ID
+    - Signal_11_of_ID
+    - Signal_12_of_ID
+    - Signal_13_of_ID
+    - Signal_14_of_ID
+    - Signal_15_of_ID
+    - Signal_16_of_ID
+    - Signal_17_of_ID
+    - Signal_18_of_ID
+    - Signal_19_of_ID
+    - Signal_20_of_ID
+    - Signal_21_of_ID
+    - Signal_22_of_ID
 
 # -----------------------------------------------------------------------------
 # MODELS
 # -----------------------------------------------------------------------------
 models:
   lstm_autoencoder:
-    input_size: 10          # len(channels)
-    hidden_size: 64
+    input_size: 22
+    hidden_size: 96
     num_layers: 2
-    latent_size: 16         # bottleneck — drives compression ratio
+    latent_size: 24
     dropout: 0.2
-    bidirectional: false    # keep unidirectional for causal, real-time inference
+    bidirectional: false
 
   isolation_forest:
     n_estimators: 200
     max_samples: auto
-    contamination: 0.03     # mirrors anomaly_ratio above
+    contamination: 0.05
     max_features: 1.0
     n_jobs: -1
     random_state: 42
 
   ensemble:
-    # Weighted average of normalised anomaly scores from both models.
-    # Adjust weights depending on validation performance; IF tends to excel
-    # at point anomalies, LSTM-AE at contextual / temporal patterns.
     lstm_ae_weight: 0.60
     isolation_forest_weight: 0.40
-    # Final decision threshold on the combined score (0–1)
-    # Calibrated on validation set; override with evaluate.py --calibrate
     decision_threshold: 0.50
 
 # -----------------------------------------------------------------------------
@@ -87,9 +100,9 @@ training:
   learning_rate: 1.0e-3
   weight_decay: 1.0e-5
   lr_scheduler:
-    type: cosine             # cosine | step | plateau
+    type: cosine
     min_lr: 1.0e-5
-    t_max: 100               # epochs for cosine cycle
+    t_max: 100
   early_stopping:
     patience: 15
     min_delta: 1.0e-5
@@ -97,15 +110,14 @@ training:
   gradient_clip_norm: 1.0
   num_workers: 4
   pin_memory: true
-  mixed_precision: false     # set true if CUDA available — not needed on edge
+  mixed_precision: false
 
 # -----------------------------------------------------------------------------
 # EVALUATION
 # -----------------------------------------------------------------------------
 evaluation:
-  # Threshold calibration strategy on validation set
-  threshold_strategy: f1_optimal   # f1_optimal | percentile | fixed
-  percentile: 95                   # used when strategy=percentile
+  threshold_strategy: percentile
+  percentile: 95
   metrics:
     - precision
     - recall
@@ -115,26 +127,38 @@ evaluation:
 
 # -----------------------------------------------------------------------------
 # SIGNAL CORRELATOR
+# Subsystem groupings use Signal_N_of_ID convention (ROAD-aligned).
 # -----------------------------------------------------------------------------
 correlator:
-  # Cross-channel correlation to identify root-cause sub-system events
-  max_lag_seconds: 5        # look-back window for lagged correlation
-  correlation_threshold: 0.65
+  max_lag_seconds: 5
+  correlation_threshold: 0.55
   subsystems:
     powertrain:
-      - engine_rpm
-      - throttle_position_pct
-      - vehicle_speed_kmh
+      - Signal_1_of_ID
+      - Signal_2_of_ID
+      - Signal_3_of_ID
+      - Signal_4_of_ID
+      - Signal_5_of_ID
+      - Signal_6_of_ID
     electrical:
-      - battery_voltage_v
-      - can_latency_us
+      - Signal_7_of_ID
+      - Signal_8_of_ID
+      - Signal_9_of_ID
+      - Signal_10_of_ID
     thermal:
-      - coolant_temp_c
-      - oil_pressure_bar
+      - Signal_11_of_ID
+      - Signal_12_of_ID
+      - Signal_13_of_ID
+      - Signal_14_of_ID
     dynamics:
-      - accel_x_g
-      - accel_y_g
-      - accel_z_g
+      - Signal_15_of_ID
+      - Signal_16_of_ID
+      - Signal_17_of_ID
+      - Signal_18_of_ID
+      - Signal_19_of_ID
+      - Signal_20_of_ID
+      - Signal_21_of_ID
+      - Signal_22_of_ID
 
 # -----------------------------------------------------------------------------
 # PATHS

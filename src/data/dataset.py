@@ -1,12 +1,32 @@
 """
 src/data/dataset.py
 
-Sliding-window dataset builder with:
-  - Z-score normalisation (fit on normal train data only — avoids leakage)
-  - Sliding windows with configurable size and stride
-  - Feature engineering: rolling statistics appended to raw channels
-  - PyTorch Dataset wrappers for DataLoader compatibility
-  - Support for ROAD dataset loading alongside synthetic data
+Dataset preparation pipeline with a unified contract:
+
+    INPUT  (identical for synthetic and real ROAD data)
+    -------------------------------------------------------
+    df_ambient  — all-normal rows  (Label=0 everywhere)
+                  source: ambient/ folder  OR  simulator.generate_ambient()
+
+    df_attacks  — mixed rows       (Label ∈ {0,1})
+                  source: attacks/ folder  OR  simulator.generate_attacks()
+
+    SPLIT STRATEGY
+    -------------------------------------------------------
+    df_ambient  → temporal 80/20 → TRAIN (normal) | VAL (normal + used for
+                                                    threshold calibration)
+    df_attacks  → entirely → TEST  (ground-truth labels from Label col)
+
+    WHY TEMPORAL (not random) SPLIT?
+    Time-series shuffling causes temporal leakage — the model sees future
+    context during training.  Temporal split preserves causal direction and
+    accurately simulates production deployment where the model sees new data
+    arriving after the training window.
+
+    NORMALISER
+    -------------------------------------------------------
+    Fit on TRAIN rows only (all normal, no leakage).
+    Applied to TRAIN, VAL, and TEST identically.
 """
 
 from __future__ import annotations
@@ -38,22 +58,23 @@ class SignalNormaliser:
     def fit(self, X: np.ndarray) -> "SignalNormaliser":
         """X: (N, T, C) or (N, C) — fit across first two dims."""
         flat = X.reshape(-1, X.shape[-1])
-        self.mean_ = flat.mean(axis=0)
-        self.std_ = flat.std(axis=0) + 1e-8   # epsilon guards against dead channels
-        logger.debug("Normaliser fitted — mean={}, std={}", self.mean_.round(2), self.std_.round(2))
+        self.mean_ = flat.mean(axis=0).astype(np.float32)
+        self.std_  = (flat.std(axis=0) + 1e-8).astype(np.float32)
+        logger.debug("Normaliser fitted on {:,} samples — {} channels", len(flat), len(self.mean_))
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         assert self.mean_ is not None, "Call fit() before transform()"
-        return (X - self.mean_) / self.std_
+        return ((X - self.mean_) / self.std_).astype(np.float32)
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
         return self.fit(X).transform(X)
 
     def inverse_transform(self, X: np.ndarray) -> np.ndarray:
-        return X * self.std_ + self.mean_
+        return (X * self.std_ + self.mean_).astype(np.float32)
 
     def save(self, path: str) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump({"mean": self.mean_, "std": self.std_}, f)
         logger.info("Normaliser saved → {}", path)
@@ -79,106 +100,91 @@ def extract_windows(
     stride: int = 10,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Extract overlapping sliding windows from a multi-channel DataFrame.
+    Slide a fixed-size window over a (time x channels) DataFrame.
 
-    Returns:
-        X         (N, T, C) — signal windows
-        y         (N,)      — window-level label (1 if any sample anomalous)
-        anom_type (N,)      — most frequent anomaly type in the window
+    Returns
+    -------
+    X          (N, T, C)  signal windows
+    y          (N,)       window label — 1 if ANY sample in window is anomalous
+    anom_types (N,)       most common anomaly type in window ("normal" if clean)
     """
-    signals = df[channel_cols].values.astype(np.float32)   # (T_total, C)
-    labels = df["is_anomaly"].values if "is_anomaly" in df.columns else np.zeros(len(df))
-    anom_types = df["anomaly_type"].values if "anomaly_type" in df.columns else np.full(len(df), "unknown")
+    signals = df[channel_cols].values.astype(np.float32)
+    labels  = df["Label"].values  if "Label"  in df.columns else np.zeros(len(df), dtype=np.int32)
+    types   = df["anomaly_type"].values if "anomaly_type" in df.columns else np.full(len(df), "unknown")
 
-    T = len(signals)
+    T_total = len(signals)
     windows, win_labels, win_types = [], [], []
 
-    for start in range(0, T - window_size + 1, stride):
+    for start in range(0, T_total - window_size + 1, stride):
         end = start + window_size
         windows.append(signals[start:end])
-        win_labels.append(int(labels[start:end].max()))  # window is anomalous if any sample is
+        win_labels.append(int(labels[start:end].max()))
 
-        # Most frequent anomaly type in window (excluding 'normal')
-        types_in_win = anom_types[start:end]
-        non_normal = [t for t in types_in_win if t != "normal"]
+        non_normal = [t for t in types[start:end] if t != "normal"]
         win_types.append(non_normal[0] if non_normal else "normal")
 
-    X = np.stack(windows, axis=0)            # (N, T, C)
-    y = np.array(win_labels, dtype=np.int32) # (N,)
-    anom_type_arr = np.array(win_types)      # (N,)
+    if not windows:
+        # Edge case: df shorter than one window
+        logger.warning("DataFrame has fewer rows ({}) than window_size ({}). Returning empty arrays.",
+                       T_total, window_size)
+        C = len(channel_cols)
+        return np.empty((0, window_size, C), np.float32), np.empty(0, np.int32), np.empty(0, object)
 
-    anomaly_rate = y.mean()
-    logger.info("Extracted {:,} windows | window_size={} | stride={} | anomaly_rate={:.2%}",
-                len(X), window_size, stride, anomaly_rate)
-    return X, y, anom_type_arr
+    X         = np.stack(windows).astype(np.float32)   # (N, T, C)
+    y         = np.array(win_labels, dtype=np.int32)   # (N,)
+    anom_type = np.array(win_types,  dtype=object)      # (N,)
 
-
-# ---------------------------------------------------------------------------
-# Feature engineering — rolling stats appended to raw channels
-# ---------------------------------------------------------------------------
-def engineer_features(df: pd.DataFrame, channel_cols: List[str], window_seconds: int = 10, hz: int = 10) -> pd.DataFrame:
-    """
-    Append rolling mean, std, and delta features.
-    These give the Isolation Forest richer local context.
-    The LSTM-AE consumes the raw channels only (learns its own temporal features).
-    """
-    roll_win = window_seconds * hz
-    enriched = df.copy()
-    for col in channel_cols:
-        enriched[f"{col}__rmean"] = df[col].rolling(roll_win, min_periods=1).mean()
-        enriched[f"{col}__rstd"] = df[col].rolling(roll_win, min_periods=1).std().fillna(0)
-        enriched[f"{col}__delta"] = df[col].diff().fillna(0)
-    return enriched
+    logger.info(
+        "extract_windows → {:,} windows (size={}, stride={}) | anomaly_rate={:.2%}",
+        len(X), window_size, stride, y.mean() if len(y) else 0,
+    )
+    return X, y, anom_type
 
 
 # ---------------------------------------------------------------------------
 # PyTorch Dataset wrappers
 # ---------------------------------------------------------------------------
 class WindowDataset(Dataset):
-    """Dataset for LSTM Autoencoder — returns (window, window) for reconstruction."""
+    """For LSTM-AE: returns (window, window) for reconstruction training."""
 
     def __init__(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> None:
-        self.X = torch.from_numpy(X).float()   # (N, T, C)
+        self.X = torch.from_numpy(X).float()
         self.y = torch.from_numpy(y).long() if y is not None else None
 
     def __len__(self) -> int:
         return len(self.X)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
         if self.y is not None:
             return self.X[idx], self.y[idx]
         return self.X[idx]
 
 
-class FeatureDataset(Dataset):
-    """Dataset for Isolation Forest — returns flattened feature vectors."""
-
-    def __init__(self, X_flat: np.ndarray, y: Optional[np.ndarray] = None) -> None:
-        self.X = X_flat.astype(np.float32)
-        self.y = y
-
-    def __len__(self) -> int:
-        return len(self.X)
-
-    def __getitem__(self, idx: int):
-        return self.X[idx], (self.y[idx] if self.y is not None else -1)
-
-
 # ---------------------------------------------------------------------------
-# High-level dataset builder
+# VehicleDatasetBuilder — unified contract for synthetic AND real data
 # ---------------------------------------------------------------------------
 class VehicleDatasetBuilder:
     """
-    Orchestrates the full data preparation pipeline:
-      1. Accept DataFrame (synthetic or real)
-      2. Optional feature engineering
-      3. Train/val/test split (temporal — never shuffle time-series!)
-      4. Normalise on train-normal only
-      5. Return window arrays and fitted normaliser
+    Orchestrates the complete data-preparation pipeline.
 
-    Temporal split rationale: random splitting of time-series causes temporal
-    leakage — the model sees future context during training. Temporal split
-    respects the causal direction and better simulates production deployment.
+    Usage (identical for synthetic and ROAD):
+    -----------------------------------------
+        builder = VehicleDatasetBuilder(cfg)
+        splits  = builder.build(df_ambient, df_attacks)
+
+        splits["train"]  ->  (X_train, y_train, types_train)
+        splits["val"]    ->  (X_val,   y_val,   types_val)
+        splits["test"]   ->  (X_test,  y_test,  types_test)
+
+    Split logic
+    -----------
+        df_ambient  (all normal)  ->  temporal 80/20  →  train | val
+        df_attacks  (with labels) ->  entirely         →  test
+
+    Normaliser
+    ----------
+        Fit on TRAIN rows only (guarantees zero label leakage).
+        Saved to checkpoints for inference-time reuse.
     """
 
     def __init__(self, cfg: dict) -> None:
@@ -187,52 +193,63 @@ class VehicleDatasetBuilder:
 
     def build(
         self,
-        df: pd.DataFrame,
+        df_ambient: pd.DataFrame,
+        df_attacks: pd.DataFrame,
         channel_cols: Optional[List[str]] = None,
     ) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
-        Returns dict with keys 'train', 'val', 'test', each a tuple (X, y, anom_types).
-        X shape: (N, T, C) where T=window_size, C=len(channel_cols)
+        Parameters
+        ----------
+        df_ambient : all-normal DataFrame — train + val source
+        df_attacks : labelled DataFrame   — test source
+        channel_cols : override channel list (defaults to cfg channels)
+
+        Returns
+        -------
+        dict with keys "train", "val", "test", each a tuple (X, y, anom_types)
         """
         if channel_cols is None:
             channel_cols = self.cfg["data"]["channels"]
 
+        val_frac    = self.cfg["data"]["val_split"]        # e.g. 0.20
         window_size = self.cfg["data"]["window"]["size"]
-        stride = self.cfg["data"]["window"]["stride"]
-        train_frac = self.cfg["data"]["window"]["train_split"]
-        val_frac = self.cfg["data"]["window"]["val_split"]
+        stride      = self.cfg["data"]["window"]["stride"]
 
-        # -- Temporal split on raw df BEFORE windowing
-        N = len(df)
-        train_end = int(N * train_frac)
-        val_end = int(N * (train_frac + val_frac))
+        # ── 1. Temporal split of ambient → train / val ─────────────────
+        N_amb  = len(df_ambient)
+        val_start = int(N_amb * (1.0 - val_frac))
 
-        df_train = df.iloc[:train_end]
-        df_val = df.iloc[train_end:val_end]
-        df_test = df.iloc[val_end:]
+        df_train = df_ambient.iloc[:val_start].copy()
+        df_val   = df_ambient.iloc[val_start:].copy()
+        df_test  = df_attacks.copy()
 
-        logger.info("Temporal split — train={:,} val={:,} test={:,} samples",
-                    len(df_train), len(df_val), len(df_test))
+        logger.info(
+            "Split — ambient_total={:,} → train={:,} val={:,} | attacks → test={:,}",
+            N_amb, len(df_train), len(df_val), len(df_test),
+        )
 
-        # -- Normaliser: fit on train-normal only (strict — no leakage)
-        normal_mask = df_train["is_anomaly"] == 0 if "is_anomaly" in df_train.columns else pd.Series(True, index=df_train.index)
-        train_normal_signals = df_train.loc[normal_mask, channel_cols].values.astype(np.float32)
-        self.normaliser = SignalNormaliser().fit(train_normal_signals)
+        # ── 2. Fit normaliser on TRAIN rows only ────────────────────────
+        train_signals = df_train[channel_cols].values.astype(np.float32)
+        self.normaliser = SignalNormaliser().fit(train_signals)
 
-        splits = {}
+        # ── 3. Normalise all splits ────────────────────────────────────
+        splits: Dict[str, Tuple] = {}
         for name, split_df in [("train", df_train), ("val", df_val), ("test", df_test)]:
-            # Apply normalisation
-            normalised = split_df.copy()
-            normalised[channel_cols] = self.normaliser.transform(
+            norm_df = split_df.copy()
+            norm_df[channel_cols] = self.normaliser.transform(
                 split_df[channel_cols].values.astype(np.float32)
             )
-            X, y, anom_types = extract_windows(normalised, channel_cols, window_size, stride)
+            X, y, anom_types = extract_windows(norm_df, channel_cols, window_size, stride)
             splits[name] = (X, y, anom_types)
+            logger.info(
+                "  {} → {:,} windows | anomaly_rate={:.2%}",
+                name, len(X), y.mean() if len(y) else 0.0,
+            )
 
         return splits
 
     def save_normaliser(self, path: str) -> None:
-        assert self.normaliser is not None
+        assert self.normaliser is not None, "Call build() first"
         self.normaliser.save(path)
 
     def load_normaliser(self, path: str) -> None:
@@ -240,64 +257,112 @@ class VehicleDatasetBuilder:
 
 
 # ---------------------------------------------------------------------------
-# ROAD dataset loader (plug-in when real data is available)
+# ROAD dataset loader — returns (df_ambient, df_attacks)
 # ---------------------------------------------------------------------------
-def load_road_dataset(data_dir: str, channel_cols: List[str]) -> pd.DataFrame:
+ROAD_COLS = ['Label', 'Time', 'ID'] + [f"Signal_{i}_of_ID" for i in range(1, 23)]
+
+def load_road_dataset(data_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Loads the Real ORNL Automotive Dynamometer (ROAD) dataset.
+    Load the ROAD dataset and return (df_ambient, df_attacks) using the
+    same schema as the simulator so that VehicleDatasetBuilder.build()
+    works identically for both.
 
-    Download: https://0xsam.com/road/
-    Paper: https://arxiv.org/abs/2012.14600
+    Expected directory layout
+    -------------------------
+    data_dir/
+        ambient/
+            *.csv               ← normal driving recordings
+        attacks/
+            **/*.csv            ← attack recordings (any subfolder depth)
 
-    The ROAD dataset contains natural (non-injected) driving data and
-    three attack categories: fabrication, masquerade, and fuzzing.
-    This loader maps those to the same schema as the simulator.
+    ROAD CSV columns (used here)
+    ----------------------------
+        Signal_1_of_ID … Signal_22_of_ID   — decoded signal values
+        Label                               — 0=normal, 1=attack  (attacks only)
 
-    Expects the directory structure:
-        data_dir/
-            ambient/          — normal driving recordings (.csv)
-            attacks/          — attack recordings
-                fabrication/
-                masquerade/
-                fuzzing/
+    NaN handling: forward-fill then zero-fill (some signals not present in
+    every CAN frame; ROAD convention is to leave those cells empty).
+
+    Reference
+    ---------
+    Dataset : https://0xsam.com/road/
+    Paper   : https://arxiv.org/abs/2012.14600
     """
-    import os
     data_dir = Path(data_dir)
-    dfs = []
-
     ambient_dir = data_dir / "ambient"
+    attacks_dir = data_dir / "attacks"
+
     if not ambient_dir.exists():
         raise FileNotFoundError(
-            f"ROAD dataset not found at {data_dir}.\n"
-            "Download from https://0xsam.com/road/ and extract to data/road/"
+            f"ambient/ folder not found at {data_dir}.\n"
+            "Download ROAD dataset from https://0xsam.com/road/ and extract to "
+            f"{data_dir}.\nExpected layout:  {data_dir}/ambient/*.csv  and  "
+            f"{data_dir}/attacks/**/*.csv"
         )
 
     # Load normal (ambient) files
+    ambient_dfs = []
     for fpath in sorted(ambient_dir.glob("*.csv")):
-        df = pd.read_csv(fpath)
-        df["is_anomaly"] = 0
-        df["anomaly_type"] = "normal"
-        dfs.append(df)
-        logger.debug("Loaded ambient: {}", fpath.name)
+        df = _load_road_csv(fpath)
+        ambient_dfs.append(df)
+        logger.debug("Ambient loaded: {} ({:,} rows)", fpath.name, len(df))
 
-    # Load attack files
-    attack_dirs = {
-        "fabrication": data_dir / "attacks" / "fabrication",
-        "masquerade": data_dir / "attacks" / "masquerade",
-        "fuzzing": data_dir / "attacks" / "fuzzy",
-    }
-    for attack_type, attack_dir in attack_dirs.items():
-        if not attack_dir.exists():
-            continue
-        for fpath in sorted(attack_dir.glob("*.csv")):
-            df = pd.read_csv(fpath)
-            # ROAD labels: 'Label' column has 1 for attack samples
-            df["is_anomaly"] = df["Label"].astype(int) if "Label" in df.columns else 1
-            df["anomaly_type"] = attack_type
-            dfs.append(df)
-            logger.debug("Loaded attack ({}): {}", attack_type, fpath.name)
+    if not ambient_dfs:
+        raise FileNotFoundError(f"No .csv files found in {ambient_dir}")
 
-    combined = pd.concat(dfs, ignore_index=True)
-    logger.info("ROAD dataset loaded — {:,} total samples, {:.2%} anomalous",
-                len(combined), combined["is_anomaly"].mean())
-    return combined
+    df_ambient = pd.concat(ambient_dfs, ignore_index=True)
+    logger.info("ROAD ambient — {:,} rows total", len(df_ambient))
+
+    # Attacks (test source)
+    attack_dfs = []
+    if attacks_dir.exists():
+        for fpath in sorted(attacks_dir.rglob("*.csv")):   # any subfolder depth
+            # Infer attack type from parent folder name
+            attack_type = fpath.stem.split('_attack')[0] + '_attack'
+            df = _load_road_csv(fpath, attack_type=attack_type)
+            attack_dfs.append(df)
+            logger.debug("Attack ({}) loaded: {} ({:,} rows)", attack_type, fpath.name, len(df))
+
+    if not attack_dfs:
+        logger.warning("No attack CSVs found in {}. Test set will be empty.", attacks_dir)
+        df_attacks = pd.DataFrame(columns=ROAD_COLS + ["Label", "anomaly_type", "vehicle_id"])
+    else:
+        df_attacks = pd.concat(attack_dfs, ignore_index=True)
+
+    logger.info(
+        "ROAD attacks — {:,} rows | anomaly_rate={:.2%}",
+        len(df_attacks), df_attacks["Label"].mean() if len(df_attacks) else 0,
+    )
+    return df_ambient, df_attacks
+
+
+def _load_road_csv(
+    fpath: Path,
+    attack_type: str = "attack",
+) -> pd.DataFrame:
+    """
+    Load one ROAD CSV, select Signal columns, handle NaN, attach labels.
+    """
+    raw = pd.read_csv(fpath, low_memory=False)
+
+    # Select only the 22 signal columns that exist in this file
+    present_cols = [c for c in ROAD_COLS if c in raw.columns]
+    missing_cols = [c for c in ROAD_COLS if c not in raw.columns]
+
+    df = raw.copy()
+
+    # Add any missing signal columns as zeros (some CAN IDs have < 22 signals)
+    for c in missing_cols:
+        df[c] = 0.0
+
+    df = df[ROAD_COLS]   # enforce consistent column order
+
+    # NaN → forward-fill within recording, then zero-fill remaining
+    df = df.ffill().fillna(0.0)
+    df = df.astype(np.float32)
+
+    # Labels
+    df["anomaly_type"] = np.where(df["Label"] == 1, attack_type, "normal")
+
+    df["vehicle_id"] = fpath.stem   # use filename as vehicle/session ID
+    return df

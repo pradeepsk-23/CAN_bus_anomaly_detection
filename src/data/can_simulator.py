@@ -1,321 +1,378 @@
 """
 src/data/can_simulator.py
 
-Realistic CAN-bus / vehicle sensor data generator.
+Physics-aware CAN-bus simulator that mirrors the ROAD dataset contract:
 
-Design goals:
-  - Mimics the statistical properties of real CAN bus signals (autocorrelated,
-    correlated across channels, regime-dependent) so that models trained here
-    generalise to real data with minimal fine-tuning.
-  - Anomaly injection is physics-aware: a battery sag event causes correlated
-    voltage drop AND CAN latency spikes, not independent noise injections.
-  - Provides a deterministic seed for reproducible CI/experiment runs.
+    generate_ambient()  ->  df_ambient  (all normal, Label=0)
+    generate_attacks()  ->  df_attacks  (anomalous portions, Label=1)
 
-Anomaly taxonomy (maps directly to JD duties):
-  VOLTAGE_SAG     — battery voltage drop → correlates with CAN latency rise
-  COOLANT_SPIKE   — thermal runaway precursor
-  RPM_DROPOUT     — engine communication loss / CAN frame loss
-  LATENCY_STORM   — bus contention / software regression
-  CRASH_PRECURSOR — combination: rpm instability + accel anomaly + latency
-  SENSOR_DRIFT    — gradual drift on oil pressure (hard to catch without AE)
+COLUMN SCHEMA — identical to the ROAD dataset CSVs:
+    Signal_1_of_ID … Signal_22_of_ID   (22 numeric channels)
+    Label                          (0 / 1)
+    anomaly_type                        ("normal" or attack name)
+    vehicle_id                          (string)
+
+This means the same VehicleDatasetBuilder, SignalNormaliser, and
+evaluation code runs unchanged on both synthetic and real data.
+
+Physics mapping (22 channels):
+    Channels  1- 6  ->  powertrain   (RPM, speed, throttle, gear proxies)
+    Channels  7-10  ->  electrical   (battery voltage, CAN latency, bus-load)
+    Channels 11-14  ->  thermal      (coolant temp, oil pressure, intake temp)
+    Channels 15-22  ->  dynamics     (accel X/Y/Z, yaw, steering, brake, susp)
+
+Attack taxonomy (matches ROAD fabrication / masquerade / fuzzy categories
+                 plus domain-relevant sub-types):
+    voltage_sag      -> electrical  (battery/alternator fault)
+    coolant_spike    -> thermal     (thermostat failure)
+    rpm_dropout      -> powertrain  (ECU comms loss / frame drop)
+    latency_storm    -> electrical  (bus contention / SW regression)
+    crash_precursor  -> composite   (multi-channel instability)
+    sensor_drift     -> thermal     (gradual pressure sensor drift)
+    fuzzy_flood      -> electrical  (fuzzy injection — random CAN frames)
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict
 from loguru import logger
 
+# ---------------------------------------------------------------------------
+# Channel names — must match ROAD dataset CSV headers exactly
+# ---------------------------------------------------------------------------
+N_CHANNELS = 22
+CHANNEL_NAMES: List[str] = [f"Signal_{i}_of_ID" for i in range(1, N_CHANNELS + 1)]
+
+# Subsystem index slices (0-based)
+POWERTRAIN = slice(0, 6)    # signals 1–6
+ELECTRICAL = slice(6, 10)   # signals 7–10
+THERMAL    = slice(10, 14)  # signals 11–14
+DYNAMICS   = slice(14, 22)  # signals 15–22
 
 # ---------------------------------------------------------------------------
-# Signal definitions — nominal operating envelope per channel
+# Per-channel physical properties (mean, std, AR coefficient, value range)
 # ---------------------------------------------------------------------------
 @dataclass
-class SignalSpec:
-    name: str
-    nominal_mean: float
-    nominal_std: float
-    min_val: float
-    max_val: float
-    # AR(1) coefficient — controls temporal autocorrelation (0=white noise, ~1=slow drift)
-    ar_coeff: float = 0.95
+class _ChannelSpec:
+    mean: float
+    std:  float
+    ar:   float        # AR(1) coefficient — higher = smoother / slower drift
+    lo:   float        # physical minimum
+    hi:   float        # physical maximum
 
-
-SIGNAL_SPECS: List[SignalSpec] = [
-    SignalSpec("engine_rpm",          mean:=1800, std:=150, min_val=600,  max_val=6500, ar_coeff=0.92),
-    SignalSpec("vehicle_speed_kmh",   mean:=65,   std:=10,  min_val=0,    max_val=200,  ar_coeff=0.97),
-    SignalSpec("battery_voltage_v",   mean:=14.2, std:=0.3, min_val=9.0,  max_val=16.0, ar_coeff=0.98),
-    SignalSpec("oil_pressure_bar",    mean:=3.5,  std:=0.3, min_val=0.5,  max_val=7.0,  ar_coeff=0.96),
-    SignalSpec("coolant_temp_c",      mean:=88,   std:=3,   min_val=20,   max_val=130,  ar_coeff=0.99),
-    SignalSpec("throttle_position_pct", mean:=25, std:=12,  min_val=0,    max_val=100,  ar_coeff=0.85),
-    SignalSpec("can_latency_us",      mean:=120,  std:=20,  min_val=50,   max_val=5000, ar_coeff=0.80),
-    SignalSpec("accel_x_g",           mean:=0.05, std:=0.1, min_val=-2.0, max_val=2.0,  ar_coeff=0.70),
-    SignalSpec("accel_y_g",           mean:=0.0,  std:=0.1, min_val=-2.0, max_val=2.0,  ar_coeff=0.70),
-    SignalSpec("accel_z_g",           mean:=1.0,  std:=0.05,min_val=-2.0, max_val=3.0,  ar_coeff=0.85),
+# One entry per channel in CHANNEL_NAMES order
+_SPECS: List[_ChannelSpec] = [
+    # Powertrain (1–6)
+    _ChannelSpec(1800, 150, 0.92, 600,  6500),  # 1 engine RPM
+    _ChannelSpec(65,    10, 0.97,  0,    200),  # 2 vehicle speed km/h
+    _ChannelSpec(25,    12, 0.85,  0,    100),  # 3 throttle position %
+    _ChannelSpec(3.2,  0.3, 0.90,  1,      7),  # 4 gear / trans ratio proxy
+    _ChannelSpec(0.85, 0.05,0.93,  0,      1),  # 5 clutch position
+    _ChannelSpec(210,  15,  0.88, 100,   500),  # 6 torque proxy Nm
+    # Electrical (7–10)
+    _ChannelSpec(14.2, 0.3, 0.98,  9,   16.0), # 7 battery voltage V
+    _ChannelSpec(120,  20,  0.80, 50,   5000), # 8 CAN latency µs
+    _ChannelSpec(42,    5,  0.85, 10,    100), # 9 bus load %
+    _ChannelSpec(12.6, 0.2, 0.97,  9,   14.5), # 10 aux voltage V
+    # Thermal (11–14)
+    _ChannelSpec(88,    3,  0.99, 20,    130), # 11 coolant temp °C
+    _ChannelSpec(3.5,  0.3, 0.96,  0.5,  7.0), # 12 oil pressure bar
+    _ChannelSpec(35,    4,  0.95, -20,   100), # 13 intake air temp °C
+    _ChannelSpec(90,    5,  0.97, 50,    200), # 14 exhaust temp proxy °C
+    # Dynamics (15–22)
+    _ChannelSpec(0.05, 0.10, 0.70, -3,    3),  # 15 accel X g
+    _ChannelSpec(0.00, 0.10, 0.70, -3,    3),  # 16 accel Y g
+    _ChannelSpec(1.00, 0.05, 0.85, -2,    4),  # 17 accel Z g
+    _ChannelSpec(0.00, 0.02, 0.75, -1,    1),  # 18 yaw rate rad/s
+    _ChannelSpec(0.00, 0.15, 0.80, -5,    5),  # 19 steering angle proxy
+    _ChannelSpec(0.05, 0.10, 0.88,  0,    1),  # 20 brake pressure proxy
+    _ChannelSpec(0.50, 0.08, 0.92,  0,    1),  # 21 front suspension deflect
+    _ChannelSpec(0.50, 0.08, 0.92,  0,    1),  # 22 rear  suspension deflect
 ]
-
-# Rework the dataclass — Python walrus in default arg doesn't work cleanly; redefine:
-SIGNAL_SPECS = [
-    SignalSpec("engine_rpm",            1800, 150,  600,   6500, 0.92),
-    SignalSpec("vehicle_speed_kmh",     65,   10,   0,     200,  0.97),
-    SignalSpec("battery_voltage_v",     14.2, 0.3,  9.0,   16.0, 0.98),
-    SignalSpec("oil_pressure_bar",      3.5,  0.3,  0.5,   7.0,  0.96),
-    SignalSpec("coolant_temp_c",        88,   3,    20,    130,  0.99),
-    SignalSpec("throttle_position_pct", 25,   12,   0,     100,  0.85),
-    SignalSpec("can_latency_us",        120,  20,   50,    5000, 0.80),
-    SignalSpec("accel_x_g",             0.05, 0.1,  -2.0,  2.0,  0.70),
-    SignalSpec("accel_y_g",             0.0,  0.1,  -2.0,  2.0,  0.70),
-    SignalSpec("accel_z_g",             1.0,  0.05, -2.0,  3.0,  0.85),
-]
-
-CHANNEL_NAMES = [s.name for s in SIGNAL_SPECS]
+assert len(_SPECS) == N_CHANNELS
 
 
 # ---------------------------------------------------------------------------
-# Anomaly event definitions
+# Anomaly event record
 # ---------------------------------------------------------------------------
 @dataclass
 class AnomalyEvent:
-    anomaly_type: str
-    start_idx: int
-    end_idx: int
-    severity: float          # 0–1, drives magnitude of perturbation
-    affected_channels: List[str]
+    anomaly_type:      str
+    start_idx:         int
+    end_idx:           int
+    severity:          float           # 0–1
+    affected_channels: List[int]       # 0-based channel indices
 
 
-# Physics-aware anomaly injection functions
-# Each function receives the raw signal matrix (T × C) and modifies it in-place.
+# ---------------------------------------------------------------------------
+# Physics-aware anomaly injectors
+# Each takes the signal matrix (T, C) and modifies it in-place.
+# ---------------------------------------------------------------------------
 
-def _inject_voltage_sag(
-    signals: np.ndarray, idx_map: Dict[str, int], start: int, end: int, severity: float
-) -> None:
-    """Battery sag: voltage drops, CAN latency rises (bus arbitration stress)."""
-    duration = end - start
-    envelope = np.hanning(duration)
-    drop = severity * 3.5 * envelope          # up to 3.5 V drop
-    signals[start:end, idx_map["battery_voltage_v"]] -= drop
-    latency_rise = severity * 800 * envelope  # up to 800 µs extra latency
-    signals[start:end, idx_map["can_latency_us"]] += latency_rise
+def _hann(n: int) -> np.ndarray:
+    return np.hanning(n)
 
+def _inj_voltage_sag(s, start, end, sev, **_):
+    env = _hann(end - start)
+    s[start:end, 6]  -= sev * 3.5  * env   # battery voltage V
+    s[start:end, 7]  += sev * 800  * env   # CAN latency µs
+    s[start:end, 8]  += sev * 30   * env   # bus load %
 
-def _inject_coolant_spike(
-    signals: np.ndarray, idx_map: Dict[str, int], start: int, end: int, severity: float
-) -> None:
-    """Thermal runaway precursor: coolant climbs sharply, oil pressure drops."""
-    duration = end - start
-    ramp = np.linspace(0, 1, duration)
-    signals[start:end, idx_map["coolant_temp_c"]] += severity * 30 * ramp
-    signals[start:end, idx_map["oil_pressure_bar"]] -= severity * 1.0 * ramp
+def _inj_coolant_spike(s, start, end, sev, **_):
+    ramp = np.linspace(0, 1, end - start)
+    s[start:end, 10] += sev * 35   * ramp  # coolant temp °C
+    s[start:end, 11] -= sev * 1.5  * ramp  # oil pressure bar
+    s[start:end, 13] += sev * 40   * ramp  # exhaust temp proxy
 
+def _inj_rpm_dropout(s, start, end, sev, rng, **_):
+    mask = rng.random(end - start) < sev * 0.6
+    s[start:end, 0][mask]  = 0.0            # engine RPM → 0 (frame lost)
+    s[start:end, 7] += sev * 400 * mask.astype(float)  # latency spike
 
-def _inject_rpm_dropout(
-    signals: np.ndarray, idx_map: Dict[str, int], start: int, end: int, severity: float
-) -> None:
-    """CAN frame loss: RPM reported as zero intermittently."""
-    drop_mask = np.random.random(end - start) < severity * 0.6
-    signals[start:end, idx_map["engine_rpm"]][drop_mask] = 0.0
-    signals[start:end, idx_map["can_latency_us"]] += severity * 400 * drop_mask
+def _inj_latency_storm(s, start, end, sev, rng, **_):
+    burst = rng.exponential(sev * 600, size=end - start)
+    s[start:end, 7]  += burst                           # CAN latency µs
+    s[start:end, 8]  += rng.uniform(0, sev * 40, end - start)  # bus load
+    jitter = rng.normal(0, sev * 8, end - start)
+    s[start:end, 1]  += jitter                          # speed jitter
 
+def _inj_crash_precursor(s, start, end, sev, rng, **_):
+    _inj_rpm_dropout(s, start, end, sev * 0.5, rng=rng)
+    _inj_latency_storm(s, start, end, sev * 0.7, rng=rng)
+    env = _hann(end - start)
+    s[start:end, 14] += rng.normal(0, sev * 0.8, end - start)  # accel X
+    s[start:end, 15] += sev * 1.2 * env                        # accel Y
+    s[start:end, 17] += sev * 0.4 * env                        # yaw rate
 
-def _inject_latency_storm(
-    signals: np.ndarray, idx_map: Dict[str, int], start: int, end: int, severity: float
-) -> None:
-    """Bus contention / software regression: latency spikes, speed jitter."""
-    burst = np.random.exponential(severity * 600, size=end - start)
-    signals[start:end, idx_map["can_latency_us"]] += burst
-    jitter = np.random.normal(0, severity * 8, size=end - start)
-    signals[start:end, idx_map["vehicle_speed_kmh"]] += jitter
+def _inj_sensor_drift(s, start, end, sev, **_):
+    drift = np.linspace(0, sev * 2.5, end - start)
+    s[start:end, 11] += drift                           # oil pressure drift
 
+def _inj_fuzzy_flood(s, start, end, sev, rng, **_):
+    """Simulate fuzzy CAN injection — random values on several channels."""
+    for ch in rng.choice(N_CHANNELS, size=max(3, int(sev * 8)), replace=False):
+        spec = _SPECS[ch]
+        s[start:end, ch] = rng.uniform(
+            spec.lo + (spec.hi - spec.lo) * 0.1,
+            spec.hi - (spec.hi - spec.lo) * 0.1,
+            end - start,
+        )
+    s[start:end, 7] *= 1 + sev * 3   # latency always spikes under fuzzy flood
 
-def _inject_crash_precursor(
-    signals: np.ndarray, idx_map: Dict[str, int], start: int, end: int, severity: float
-) -> None:
-    """Multi-signal composite: rpm instability + accel anomaly + latency burst."""
-    _inject_rpm_dropout(signals, idx_map, start, end, severity * 0.5)
-    _inject_latency_storm(signals, idx_map, start, end, severity * 0.7)
-    # Unusual acceleration pattern (swerve / emergency brake signature)
-    signals[start:end, idx_map["accel_x_g"]] += np.random.normal(0, severity * 0.8, end - start)
-    signals[start:end, idx_map["accel_y_g"]] += severity * 1.2 * np.hanning(end - start)
-
-
-def _inject_sensor_drift(
-    signals: np.ndarray, idx_map: Dict[str, int], start: int, end: int, severity: float
-) -> None:
-    """Gradual sensor drift on oil pressure — subtle, tests AE's temporal memory."""
-    drift = np.linspace(0, severity * 2.5, end - start)
-    signals[start:end, idx_map["oil_pressure_bar"]] += drift
-
-
-ANOMALY_INJECTORS = {
-    "voltage_sag":      (_inject_voltage_sag,     ["battery_voltage_v", "can_latency_us"]),
-    "coolant_spike":    (_inject_coolant_spike,    ["coolant_temp_c", "oil_pressure_bar"]),
-    "rpm_dropout":      (_inject_rpm_dropout,      ["engine_rpm", "can_latency_us"]),
-    "latency_storm":    (_inject_latency_storm,    ["can_latency_us", "vehicle_speed_kmh"]),
-    "crash_precursor":  (_inject_crash_precursor,  ["engine_rpm", "can_latency_us", "accel_x_g", "accel_y_g"]),
-    "sensor_drift":     (_inject_sensor_drift,     ["oil_pressure_bar"]),
+# Registry: name → (injector_fn, affected_channel_indices)
+_INJECTORS: Dict[str, Tuple] = {
+    "voltage_sag":     (_inj_voltage_sag,     [6, 7, 8]),
+    "coolant_spike":   (_inj_coolant_spike,   [10, 11, 13]),
+    "rpm_dropout":     (_inj_rpm_dropout,     [0, 7]),
+    "latency_storm":   (_inj_latency_storm,   [7, 8, 1]),
+    "crash_precursor": (_inj_crash_precursor, [0, 7, 14, 15, 17]),
+    "sensor_drift":    (_inj_sensor_drift,    [11]),
+    "fuzzy_flood":     (_inj_fuzzy_flood,     list(range(N_CHANNELS))),
 }
 
 
 # ---------------------------------------------------------------------------
-# Simulator
+# Main simulator class
 # ---------------------------------------------------------------------------
 class CANBusSimulator:
     """
-    Generates multi-channel CAN bus time-series with physics-aware anomalies.
+    Generates ambient (normal) and attack (anomalous) DataFrames that are
+    schema-identical to the ROAD dataset.
 
-    Usage:
-        sim = CANBusSimulator(seed=42)
-        df, events = sim.generate(
-            duration_seconds=7200,
-            sampling_hz=10,
-            anomaly_ratio=0.03,
-        )
+    Public API
+    ----------
+    generate_ambient(n_vehicles, duration_s, sampling_hz) → pd.DataFrame
+    generate_attacks(n_vehicles, duration_s, sampling_hz, anomaly_ratio) → pd.DataFrame
+
+    Both methods return DataFrames with columns:
+        Signal_1_of_ID … Signal_22_of_ID | Label | anomaly_type | vehicle_id
+
+    Downstream code (VehicleDatasetBuilder, normaliser, evaluator) calls
+    these two methods and never needs to know whether it is using synthetic
+    or real data.
     """
 
     def __init__(self, seed: int = 42) -> None:
-        self.rng = np.random.default_rng(seed)
-        self._specs = SIGNAL_SPECS
-        self._idx_map = {s.name: i for i, s in enumerate(self._specs)}
+        self.master_rng = np.random.default_rng(seed)
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public
     # ------------------------------------------------------------------
-    def generate(
-        self,
-        duration_seconds: int = 7200,
-        sampling_hz: int = 10,
-        anomaly_ratio: float = 0.03,
-        noise_std: float = 0.05,
-        vehicle_id: str = "VH-001",
-    ) -> Tuple[pd.DataFrame, List[AnomalyEvent]]:
-        """
-        Returns:
-            df      — DataFrame indexed by timestamp, shape (T, C+2)
-                      Columns: channels + 'is_anomaly' + 'anomaly_type'
-            events  — list of AnomalyEvent objects for evaluation
-        """
-        T = duration_seconds * sampling_hz
-        logger.debug("Simulating {} samples ({} s @ {} Hz) for {}", T, duration_seconds, sampling_hz, vehicle_id)
-
-        signals = self._generate_nominal(T, noise_std)
-        events = self._inject_anomalies(signals, T, anomaly_ratio, sampling_hz)
-
-        # Clip to physical bounds
-        for i, spec in enumerate(self._specs):
-            signals[:, i] = np.clip(signals[:, i], spec.min_val, spec.max_val)
-
-        # Build labels
-        is_anomaly = np.zeros(T, dtype=int)
-        anomaly_type = np.full(T, "normal", dtype=object)
-        for ev in events:
-            is_anomaly[ev.start_idx:ev.end_idx] = 1
-            anomaly_type[ev.start_idx:ev.end_idx] = ev.anomaly_type
-
-        timestamps = pd.date_range("2024-01-01", periods=T, freq=f"{1000 // sampling_hz}ms")
-        df = pd.DataFrame(signals, index=timestamps, columns=CHANNEL_NAMES)
-        df["is_anomaly"] = is_anomaly
-        df["anomaly_type"] = anomaly_type
-        df["vehicle_id"] = vehicle_id
-
-        logger.info(
-            "vehicle={} | samples={:,} | anomaly_windows={} | anomaly_rate={:.2%}",
-            vehicle_id, T, sum(ev.end_idx - ev.start_idx for ev in events), is_anomaly.mean(),
-        )
-        return df, events
-
-    def generate_fleet(
+    def generate_ambient(
         self,
         n_vehicles: int = 5,
-        duration_seconds: int = 7200,
+        duration_s: int = 7200,
         sampling_hz: int = 10,
-        anomaly_ratio: float = 0.03,
-    ) -> Tuple[pd.DataFrame, Dict[str, List[AnomalyEvent]]]:
-        """Generate independent streams for a fleet of vehicles."""
-        dfs, all_events = [], {}
+        noise_std: float = 0.05,
+    ) -> pd.DataFrame:
+        """
+        All-normal driving data → mirrors ambient/ folder of ROAD dataset.
+        Label=0 for every row.
+        """
+        dfs = []
         for i in range(n_vehicles):
-            vid = f"VH-{i+1:03d}"
-            # Different seed per vehicle → independent noise realisations
-            sim = CANBusSimulator(seed=self.rng.integers(0, 9999))
-            df, events = sim.generate(duration_seconds, sampling_hz, anomaly_ratio, vehicle_id=vid)
+            vid = f"AMB-{i+1:03d}"
+            seed_i = int(self.master_rng.integers(0, 99999))
+            df = self._generate_single_ambient(
+                vehicle_id=vid, duration_s=duration_s,
+                sampling_hz=sampling_hz, noise_std=noise_std, seed=seed_i,
+            )
             dfs.append(df)
-            all_events[vid] = events
-        combined = pd.concat(dfs, ignore_index=False)
-        return combined, all_events
+        result = pd.concat(dfs, ignore_index=True)
+        logger.info(
+            "Ambient generated — {} vehicles × {:,}s @ {}Hz = {:,} rows total",
+            n_vehicles, duration_s, sampling_hz, len(result),
+        )
+        return result
+
+    def generate_attacks(
+        self,
+        n_vehicles: int = 2,
+        duration_s: int = 1800,
+        sampling_hz: int = 10,
+        anomaly_ratio: float = 0.08,
+        noise_std: float = 0.05,
+    ) -> pd.DataFrame:
+        """
+        Attack data → mirrors attacks/ folder of ROAD dataset.
+        Each row has Label ∈ {0, 1} and anomaly_type label.
+        """
+        dfs = []
+        for i in range(n_vehicles):
+            vid = f"ATK-{i+1:03d}"
+            seed_i = int(self.master_rng.integers(0, 99999))
+            df = self._generate_single_attack(
+                vehicle_id=vid, duration_s=duration_s,
+                sampling_hz=sampling_hz, anomaly_ratio=anomaly_ratio,
+                noise_std=noise_std, seed=seed_i,
+            )
+            dfs.append(df)
+        result = pd.concat(dfs, ignore_index=True)
+        logger.info(
+            "Attacks generated — {} vehicles × {:,}s @ {}Hz = {:,} rows | anomaly_rate={:.2%}",
+            n_vehicles, duration_s, sampling_hz, len(result), result["Label"].mean(),
+        )
+        return result
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Private — single-vehicle generation
     # ------------------------------------------------------------------
-    def _generate_nominal(self, T: int, noise_std: float) -> np.ndarray:
-        """AR(1) process per channel with cross-channel correlations."""
-        n_channels = len(self._specs)
-        signals = np.zeros((T, n_channels))
+    def _generate_single_ambient(
+        self, vehicle_id: str, duration_s: int,
+        sampling_hz: int, noise_std: float, seed: int,
+    ) -> pd.DataFrame:
+        rng = np.random.default_rng(seed)
+        T = duration_s * sampling_hz
+        signals = self._ar_process(T, noise_std, rng)
+        self._apply_cross_channel_correlations(signals)
+        self._clip_to_bounds(signals)
 
-        # Initialise at nominal mean
-        signals[0] = [s.nominal_mean for s in self._specs]
+        timestamps = pd.date_range("2024-01-01", periods=T,
+                                   freq=f"{1000 // sampling_hz}ms")
+        df = pd.DataFrame(signals, index=timestamps, columns=CHANNEL_NAMES)
+        df["Label"]  = 0
+        df["anomaly_type"] = "normal"
+        df["vehicle_id"]  = vehicle_id
+        logger.debug("Ambient vehicle={} | rows={:,}", vehicle_id, T)
+        return df
 
+    def _generate_single_attack(
+        self, vehicle_id: str, duration_s: int,
+        sampling_hz: int, anomaly_ratio: float,
+        noise_std: float, seed: int,
+    ) -> pd.DataFrame:
+        rng = np.random.default_rng(seed)
+        T = duration_s * sampling_hz
+        signals = self._ar_process(T, noise_std, rng)
+        self._apply_cross_channel_correlations(signals)
+
+        events = self._inject_anomaly_events(signals, T, anomaly_ratio, sampling_hz, rng)
+
+        self._clip_to_bounds(signals)
+
+        Label  = np.zeros(T, dtype=np.int32)
+        anomaly_type = np.full(T, "normal", dtype=object)
+        for ev in events:
+            Label[ev.start_idx:ev.end_idx]  = 1
+            anomaly_type[ev.start_idx:ev.end_idx] = ev.anomaly_type
+
+        timestamps = pd.date_range("2024-01-01", periods=T,
+                                   freq=f"{1000 // sampling_hz}ms")
+        df = pd.DataFrame(signals, index=timestamps, columns=CHANNEL_NAMES)
+        df["Label"]  = Label
+        df["anomaly_type"] = anomaly_type
+        df["vehicle_id"]  = vehicle_id
+        logger.debug(
+            "Attack vehicle={} | rows={:,} | anomaly_rate={:.2%}",
+            vehicle_id, T, Label.mean(),
+        )
+        return df
+
+    # ------------------------------------------------------------------
+    # Signal generation helpers
+    # ------------------------------------------------------------------
+    def _ar_process(self, T: int, noise_std: float, rng: np.random.Generator) -> np.ndarray:
+        """AR(1) process per channel; shape (T, C)."""
+        signals = np.zeros((T, N_CHANNELS), dtype=np.float32)
+        signals[0] = [s.mean for s in _SPECS]
         for t in range(1, T):
-            for i, spec in enumerate(self._specs):
-                # AR(1): x_t = ar * x_{t-1} + (1-ar)*mean + noise
-                innovation = self.rng.normal(0, spec.nominal_std * noise_std)
+            for i, spec in enumerate(_SPECS):
+                innovation = rng.normal(0, spec.std * noise_std)
                 signals[t, i] = (
-                    spec.ar_coeff * signals[t - 1, i]
-                    + (1 - spec.ar_coeff) * spec.nominal_mean
+                    spec.ar * signals[t - 1, i]
+                    + (1 - spec.ar) * spec.mean
                     + innovation
                 )
-
-        # Inject a realistic speed-rpm correlation
-        rpm_idx = self._idx_map["engine_rpm"]
-        spd_idx = self._idx_map["vehicle_speed_kmh"]
-        throttle_idx = self._idx_map["throttle_position_pct"]
-        signals[:, rpm_idx] += 8 * signals[:, throttle_idx]
-        signals[:, spd_idx] += 0.02 * signals[:, rpm_idx]
-
         return signals
 
-    def _inject_anomalies(
-        self, signals: np.ndarray, T: int, anomaly_ratio: float, sampling_hz: int
+    def _apply_cross_channel_correlations(self, signals: np.ndarray) -> None:
+        """Inject realistic powertrain correlations."""
+        # RPM ∝ throttle; speed ∝ RPM
+        signals[:, 0] += 8.0  * signals[:, 2]    # RPM ← throttle
+        signals[:, 1] += 0.02 * signals[:, 0]    # speed ← RPM
+        signals[:, 5] = signals[:, 0] * 0.12     # torque proxy ← RPM
+
+    def _clip_to_bounds(self, signals: np.ndarray) -> None:
+        for i, spec in enumerate(_SPECS):
+            signals[:, i] = np.clip(signals[:, i], spec.lo, spec.hi)
+
+    def _inject_anomaly_events(
+        self, signals: np.ndarray, T: int,
+        anomaly_ratio: float, sampling_hz: int,
+        rng: np.random.Generator,
     ) -> List[AnomalyEvent]:
-        """Select random non-overlapping windows and inject typed anomalies."""
-        # Target anomaly samples
-        target_anomaly_samples = int(T * anomaly_ratio)
-        anomaly_types = list(ANOMALY_INJECTORS.keys())
-        events: List[AnomalyEvent] = []
-        occupied = np.zeros(T, dtype=bool)
-
-        # Minimum gap between events (5 seconds) to avoid bleed-over
+        target = int(T * anomaly_ratio)
         min_gap = 5 * sampling_hz
-        max_attempts = 200
+        occupied = np.zeros(T, dtype=bool)
+        events: List[AnomalyEvent] = []
+        anom_names = list(_INJECTORS.keys())
 
-        for _ in range(max_attempts):
-            if occupied.sum() >= target_anomaly_samples:
+        for _ in range(300):
+            if occupied.sum() >= target:
                 break
+            atype = rng.choice(anom_names)
+            dur   = int(rng.uniform(3, 30) * sampling_hz)
+            start = int(rng.uniform(min_gap, T - dur - min_gap))
+            end   = start + dur
 
-            anom_type = self.rng.choice(anomaly_types)
-            # Event duration: 3–30 seconds
-            duration = int(self.rng.uniform(3, 30) * sampling_hz)
-            start = int(self.rng.uniform(min_gap, T - duration - min_gap))
-            end = start + duration
-
-            # Check overlap + gap
-            check_start = max(0, start - min_gap)
-            check_end = min(T, end + min_gap)
-            if occupied[check_start:check_end].any():
+            check_s = max(0, start - min_gap)
+            check_e = min(T, end + min_gap)
+            if occupied[check_s:check_e].any():
                 continue
 
-            severity = float(self.rng.uniform(0.4, 1.0))
-            injector_fn, affected_channels = ANOMALY_INJECTORS[anom_type]
-            injector_fn(signals, self._idx_map, start, end, severity)
+            sev = float(rng.uniform(0.4, 1.0))
+            fn, affected = _INJECTORS[atype]
+            fn(signals, start, end, sev, rng=rng)
             occupied[start:end] = True
+            events.append(AnomalyEvent(atype, start, end, sev, affected))
 
-            events.append(AnomalyEvent(
-                anomaly_type=anom_type,
-                start_idx=start,
-                end_idx=end,
-                severity=severity,
-                affected_channels=affected_channels,
-            ))
-
-        logger.debug("Injected {} anomaly events ({} unique types)", len(events), len({e.anomaly_type for e in events}))
+        logger.debug(
+            "Injected {} events ({} types) — actual_rate={:.2%}",
+            len(events), len({e.anomaly_type for e in events}),
+            occupied.sum() / T,
+        )
         return events
